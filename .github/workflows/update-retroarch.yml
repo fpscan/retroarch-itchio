@@ -6,7 +6,7 @@ on:
   workflow_dispatch:  
 
 env:
-  ITCH_USERNAME: gadsby
+  ITCH_USERNAME: retroarchofficial
   ITCH_PROJECT: retroarch
   STABLE_VERSION: 1.19.1
 
