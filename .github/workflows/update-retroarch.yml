@@ -1,0 +1,56 @@
+name: Update RetroArch on itch.io
+
+on:
+  schedule:
+    - cron: '0 19 * * *' 
+  workflow_dispatch:  
+
+env:
+  ITCH_USERNAME: gadsby
+  ITCH_PROJECT: retroarch
+  STABLE_VERSION: 1.19.1
+
+jobs:
+  update-retroarch:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [windows, linux]
+        arch: [x86, x86_64]
+        version: [stable, nightly]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Butler
+      uses: jdno/setup-butler@v1
+
+    - name: Download RetroArch
+      run: |
+        if [ "${{ matrix.version }}" == "stable" ]; then
+          URL="https://buildbot.libretro.com/stable/${{ env.STABLE_VERSION }}/${{ matrix.os }}/${{ matrix.arch }}/RetroArch.7z"
+        else
+          URL="https://buildbot.libretro.com/nightly/${{ matrix.os }}/${{ matrix.arch }}/RetroArch.7z"
+        fi
+        echo "Downloading from: $URL"
+        wget $URL
+        7z x RetroArch.7z
+
+    - name: Prepare package for itch.io
+      run: |
+        if [ "${{ matrix.os }}" == "windows" ]; then
+          mv RetroArch-Win${{ matrix.arch == 'x86_64' && '64' || '32' }} RetroArch
+        else
+          mv RetroArch-Linux-${{ matrix.arch }} RetroArch
+        fi
+
+    - name: Push to itch.io
+      env:
+        BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+      run: |
+        if [ "${{ matrix.version }}" == "stable" ]; then
+          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.version }} --userversion ${{ env.STABLE_VERSION }}
+        else
+          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.version }}
+        fi
