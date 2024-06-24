@@ -2,8 +2,8 @@ name: Update RetroArch on itch.io
 
 on:
   schedule:
-    - cron: '0 19 * * *' 
-  workflow_dispatch:  
+    - cron: '0 19 * * *'
+  workflow_dispatch: 
 
 env:
   ITCH_USERNAME: retroarchofficial
@@ -18,6 +18,8 @@ jobs:
         os: [windows, linux]
         arch: [x86, x86_64]
         version: [stable, nightly]
+      exclude:
+        - version: stable
 
     steps:
     - name: Checkout repository
@@ -25,6 +27,10 @@ jobs:
 
     - name: Set up Butler
       uses: jdno/setup-butler@v1
+
+    - name: Set nightly build date
+      if: matrix.version == 'nightly'
+      run: echo "NIGHTLY_DATE=$(date +'%d.%m.%Y')" >> $GITHUB_ENV
 
     - name: Download RetroArch
       run: |
@@ -52,5 +58,41 @@ jobs:
         if [ "${{ matrix.version }}" == "stable" ]; then
           butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.version }} --userversion ${{ env.STABLE_VERSION }}
         else
-          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.version }}
+          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}:${{ matrix.version }} --userversion ${{ env.NIGHTLY_DATE }}
         fi
+
+  update-retroarch-stable:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [windows, linux]
+        arch: [x86, x86_64]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Butler
+      uses: jdno/setup-butler@v1
+
+    - name: Download RetroArch
+      run: |
+        URL="https://buildbot.libretro.com/stable/${{ env.STABLE_VERSION }}/${{ matrix.os }}/${{ matrix.arch }}/RetroArch.7z"
+        echo "Downloading from: $URL"
+        wget $URL
+        7z x RetroArch.7z
+
+    - name: Prepare package for itch.io
+      run: |
+        if [ "${{ matrix.os }}" == "windows" ]; then
+          mv RetroArch-Win${{ matrix.arch == 'x86_64' && '64' || '32' }} RetroArch
+        else
+          mv RetroArch-Linux-${{ matrix.arch }} RetroArch
+        fi
+
+    - name: Push to itch.io
+      env:
+        BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+      run: |
+        butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-stable --userversion ${{ env.STABLE_VERSION }}
+      if: github.event_name == 'workflow_dispatch'
