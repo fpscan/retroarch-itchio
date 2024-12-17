@@ -23,7 +23,7 @@ jobs:
       uses: actions/checkout@v2
 
     - name: Set up Butler
-      uses: fpscan/setup-butler@7f0179e
+      uses: fpscan/setup-butler@7f0179e16a803bb780c3cee42a85ef35abc501f6
 
     - name: Set nightly build date
       run: echo "NIGHTLY_DATE=$(date +'%d.%m.%Y')" >> $GITHUB_ENV
