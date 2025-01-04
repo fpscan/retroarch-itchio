@@ -82,7 +82,4 @@ jobs:
       env:
         BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
       run: |
-        for i in {1..3}; do
-          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-stable --userversion ${{ env.STABLE_VERSION }} && break || sleep 10;
-        done
-      if: github.event_name == 'workflow_dispatch'
+          butler push RetroArch ${{ env.ITCH_USERNAME }}/${{ env.ITCH_PROJECT }}:${{ matrix.os }}-${{ matrix.arch }}-stable --userversion ${{ env.STABLE_VERSION }}
