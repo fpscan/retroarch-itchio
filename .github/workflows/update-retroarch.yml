@@ -8,7 +8,7 @@ on:
 env:
   ITCH_USERNAME: retroarchofficial
   ITCH_PROJECT: retroarch
-  STABLE_VERSION: 1.22.0
+  STABLE_VERSION: 1.22.1
 
 jobs:
   update-retroarch-nightly:
