@@ -1,0 +1,251 @@
+name: RetroArch Stable Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'RetroArch version to deploy (leave "latest" for auto-detection)'
+        required: false
+        default: 'latest'
+        type: string
+      force:
+        description: 'Force deployment even if version is already live on itch.io'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: stable-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ITCH_USERNAME: ${{ vars.ITCH_USERNAME || 'retroarchofficial' }}
+  ITCH_PROJECT: ${{ vars.ITCH_PROJECT || 'retroarch' }}
+
+jobs:
+  check-release:
+    name: Check for New Stable Release
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      version: ${{ steps.check.outputs.version }}
+      live_version: ${{ steps.check.outputs.live_version }}
+
+    steps:
+      - name: Determine Target & Live Versions
+        id: check
+        run: |
+          # 1. Fetch live version from itch.io API
+          echo "Checking currently deployed version on itch.io..."
+          ITCH_API_URL="https://api.itch.io/wharf/latest?target=${ITCH_USERNAME}/${ITCH_PROJECT}&channel_name=windows-x86_64-stable"
+          ITCH_RESP=$(curl -sSL "$ITCH_API_URL" 2>/dev/null || true)
+          LIVE_VERSION=$(echo "$ITCH_RESP" | jq -r '.latest.user_version // .user_version // empty' 2>/dev/null || true)
+
+          if [ -z "$LIVE_VERSION" ] || [ "$LIVE_VERSION" == "null" ]; then
+            # Fallback to alternate endpoint structure if needed
+            ITCH_API_URL_ALT="https://api.itch.io/1/x/wharf/latest?target=${ITCH_USERNAME}/${ITCH_PROJECT}&channel_name=windows-x86_64-stable"
+            ITCH_RESP_ALT=$(curl -sSL "$ITCH_API_URL_ALT" 2>/dev/null || true)
+            LIVE_VERSION=$(echo "$ITCH_RESP_ALT" | jq -r '.latest.user_version // .user_version // empty' 2>/dev/null || true)
+          fi
+
+          if [ -z "$LIVE_VERSION" ] || [ "$LIVE_VERSION" == "null" ]; then
+            LIVE_VERSION="unknown"
+            echo "Could not detect live version from itch.io (API returned empty or channel is new)."
+          else
+            echo "Currently live version on itch.io: $LIVE_VERSION"
+          fi
+
+          # 2. Determine upstream target version
+          INPUT_VERSION="${{ inputs.version }}"
+          FORCE="${{ inputs.force }}"
+
+          if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "latest" ]; then
+            TARGET_VERSION="$INPUT_VERSION"
+            SHOULD_RUN=true
+            echo "Manual version override specified: $TARGET_VERSION"
+          else
+            echo "Fetching latest release from libretro/RetroArch..."
+            LATEST_TAG=$(curl -s "https://api.github.com/repos/libretro/RetroArch/releases/latest" | jq -r .tag_name)
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" == "null" ]; then
+              echo "::error::Failed to fetch latest release from GitHub API"
+              exit 1
+            fi
+
+            TARGET_VERSION="${LATEST_TAG#v}"
+            echo "Latest upstream release tag: $LATEST_TAG (Version: $TARGET_VERSION)"
+
+            if [ "$TARGET_VERSION" != "$LIVE_VERSION" ] || [ "$FORCE" == "true" ]; then
+              SHOULD_RUN=true
+              echo "New version detected ($LIVE_VERSION -> $TARGET_VERSION) or force deployment requested. Proceeding."
+            else
+              SHOULD_RUN=false
+              echo "itch.io is already up-to-date with version $TARGET_VERSION. Skipping deployment."
+            fi
+          fi
+
+          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+          echo "version=$TARGET_VERSION" >> $GITHUB_OUTPUT
+          echo "live_version=$LIVE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check Step Summary
+        run: |
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ### Stable Release Check
+
+          | Check Parameter | Value |
+          | :--- | :--- |
+          | **Trigger Event** | \`${{ github.event_name }}\` |
+          | **Live itch.io Version** | \`${{ steps.check.outputs.live_version }}\` |
+          | **Target Release Version** | \`${{ steps.check.outputs.version }}\` |
+          | **Deployment Decision** | ${{ steps.check.outputs.should_run == 'true' && 'Deploying new version' || 'Up to date (Skipped)' }} |
+          EOF
+
+  publish-stable:
+    name: Sync Stable (${{ matrix.os }}-${{ matrix.arch }})
+    needs: check-release
+    if: needs.check-release.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows, linux]
+        arch: [x86, x86_64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Secrets
+        run: |
+          if [ -z "${{ secrets.BUTLER_API_KEY }}" ]; then
+            echo "::error::Secret BUTLER_API_KEY is not set. Please configure it in repository secrets."
+            exit 1
+          fi
+
+      - name: Set up Butler
+        uses: jdno/setup-butler@v2.0.0
+
+      - name: Download RetroArch Stable
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          URL="https://buildbot.libretro.com/stable/${VERSION}/${{ matrix.os }}/${{ matrix.arch }}/RetroArch.7z"
+          echo "Downloading RetroArch stable ($VERSION) from: $URL"
+
+          MAX_RETRIES=3
+          DOWNLOAD_OK=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Download attempt $i of $MAX_RETRIES..."
+            if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 -o RetroArch.7z "$URL"; then
+              DOWNLOAD_OK=true
+              break
+            fi
+            echo "Download attempt $i failed. Retrying in 10s..."
+            sleep 10
+          done
+
+          if [ "$DOWNLOAD_OK" != "true" ]; then
+            echo "::error::Failed to download stable build from $URL after $MAX_RETRIES attempts. Buildbot might not have published this build yet."
+            exit 1
+          fi
+
+      - name: Validate & Extract Archive
+        run: |
+          echo "Testing archive integrity..."
+          7z t RetroArch.7z
+
+          echo "Extracting RetroArch.7z..."
+          7z x RetroArch.7z
+
+      - name: Prepare package for itch.io
+        run: |
+          if [ "${{ matrix.os }}" == "windows" ]; then
+            if [ "${{ matrix.arch }}" == "x86_64" ]; then
+              TARGET_DIR="RetroArch-Win64"
+            else
+              TARGET_DIR="RetroArch-Win32"
+            fi
+          else
+            TARGET_DIR="RetroArch-Linux-${{ matrix.arch }}"
+          fi
+
+          if [ -d "$TARGET_DIR" ]; then
+            mv "$TARGET_DIR" RetroArch
+          elif [ -d "RetroArch" ]; then
+            echo "Directory RetroArch already exists with correct name."
+          else
+            FOUND_DIR=$(find . -maxdepth 1 -type d -name "RetroArch*" ! -name "RetroArch" | head -n 1)
+            if [ -n "$FOUND_DIR" ]; then
+              echo "Found directory $FOUND_DIR, renaming to RetroArch"
+              mv "$FOUND_DIR" RetroArch
+            else
+              echo "::error::Could not find extracted RetroArch directory"
+              ls -la
+              exit 1
+            fi
+          fi
+
+          # Ensure Linux executables have executable permissions
+          if [ "${{ matrix.os }}" == "linux" ]; then
+            chmod +x RetroArch/retroarch* 2>/dev/null || true
+          fi
+
+          # Remove archive to save disk space
+          rm -f RetroArch.7z
+
+      - name: Push to itch.io
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          CHANNEL="${{ matrix.os }}-${{ matrix.arch }}-stable"
+          TARGET="${ITCH_USERNAME}/${ITCH_PROJECT}:${CHANNEL}"
+          echo "Target channel: $TARGET"
+          echo "Stable userversion: $VERSION"
+
+          MAX_RETRIES=3
+          RETRY_DELAY=15
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i of $MAX_RETRIES: Pushing to itch.io ($TARGET)..."
+            if butler push RetroArch "$TARGET" --userversion "$VERSION"; then
+              SUCCESS=true
+              echo "Successfully pushed to itch.io channel: $CHANNEL"
+              break
+            fi
+            echo "Push failed on attempt $i."
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Retrying in ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "::error::Failed to push $CHANNEL to itch.io after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Generate Step Summary
+        if: always()
+        run: |
+          VERSION="${{ needs.check-release.outputs.version }}"
+          CHANNEL="${{ matrix.os }}-${{ matrix.arch }}-stable"
+          STATUS="${{ job.status == 'success' && 'Succeeded' || 'Failed' }}"
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ### Stable Build Summary
+
+          | Property | Value |
+          | :--- | :--- |
+          | **OS** | \`${{ matrix.os }}\` |
+          | **Architecture** | \`${{ matrix.arch }}\` |
+          | **Channel** | \`$CHANNEL\` |
+          | **Version** | \`$VERSION\` |
+          | **Destination** | [\`${ITCH_USERNAME}/${ITCH_PROJECT}\`](https://${ITCH_USERNAME}.itch.io/${ITCH_PROJECT}) |
+          | **Status** | $STATUS |
+          EOF

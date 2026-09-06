@@ -1,0 +1,158 @@
+name: RetroArch Nightly Sync
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ITCH_USERNAME: ${{ vars.ITCH_USERNAME || 'retroarchofficial' }}
+  ITCH_PROJECT: ${{ vars.ITCH_PROJECT || 'retroarch' }}
+
+jobs:
+  update-retroarch-nightly:
+    name: Sync Nightly (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows, linux]
+        arch: [x86, x86_64]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Secrets
+        run: |
+          if [ -z "${{ secrets.BUTLER_API_KEY }}" ]; then
+            echo "::error::Secret BUTLER_API_KEY is not set. Please configure it in repository secrets."
+            exit 1
+          fi
+
+      - name: Set up Butler
+        uses: jdno/setup-butler@v2.0.0
+
+      - name: Set nightly build date
+        run: echo "NIGHTLY_DATE=$(date +'%d.%m.%Y')" >> $GITHUB_ENV
+
+      - name: Download RetroArch Nightly
+        run: |
+          URL="https://buildbot.libretro.com/nightly/${{ matrix.os }}/${{ matrix.arch }}/RetroArch.7z"
+          echo "Downloading RetroArch nightly package from: $URL"
+
+          MAX_RETRIES=3
+          DOWNLOAD_OK=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Download attempt $i of $MAX_RETRIES..."
+            if curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 -o RetroArch.7z "$URL"; then
+              DOWNLOAD_OK=true
+              break
+            fi
+            echo "Download attempt $i failed. Retrying in 10s..."
+            sleep 10
+          done
+
+          if [ "$DOWNLOAD_OK" != "true" ]; then
+            echo "::error::Failed to download nightly build from $URL after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Validate & Extract Archive
+        run: |
+          echo "Testing archive integrity..."
+          7z t RetroArch.7z
+
+          echo "Extracting RetroArch.7z..."
+          7z x RetroArch.7z
+
+      - name: Prepare package for itch.io
+        run: |
+          if [ "${{ matrix.os }}" == "windows" ]; then
+            if [ "${{ matrix.arch }}" == "x86_64" ]; then
+              TARGET_DIR="RetroArch-Win64"
+            else
+              TARGET_DIR="RetroArch-Win32"
+            fi
+          else
+            TARGET_DIR="RetroArch-Linux-${{ matrix.arch }}"
+          fi
+
+          if [ -d "$TARGET_DIR" ]; then
+            mv "$TARGET_DIR" RetroArch
+          elif [ -d "RetroArch" ]; then
+            echo "Directory RetroArch already exists with correct name."
+          else
+            FOUND_DIR=$(find . -maxdepth 1 -type d -name "RetroArch*" ! -name "RetroArch" | head -n 1)
+            if [ -n "$FOUND_DIR" ]; then
+              echo "Found directory $FOUND_DIR, renaming to RetroArch"
+              mv "$FOUND_DIR" RetroArch
+            else
+              echo "::error::Could not find extracted RetroArch directory"
+              ls -la
+              exit 1
+            fi
+          fi
+
+          # Ensure Linux executables have executable permissions
+          if [ "${{ matrix.os }}" == "linux" ]; then
+            chmod +x RetroArch/retroarch* 2>/dev/null || true
+          fi
+
+          # Remove archive to save disk space
+          rm -f RetroArch.7z
+
+      - name: Push to itch.io
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
+        run: |
+          CHANNEL="${{ matrix.os }}-${{ matrix.arch }}-nightly"
+          TARGET="${ITCH_USERNAME}/${ITCH_PROJECT}:${CHANNEL}"
+          echo "Target channel: $TARGET"
+          echo "Nightly userversion: ${{ env.NIGHTLY_DATE }}"
+
+          MAX_RETRIES=3
+          RETRY_DELAY=15
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i of $MAX_RETRIES: Pushing to itch.io ($TARGET)..."
+            if butler push RetroArch "$TARGET" --userversion "${{ env.NIGHTLY_DATE }}"; then
+              SUCCESS=true
+              echo "Successfully pushed to itch.io channel: $CHANNEL"
+              break
+            fi
+            echo "Push failed on attempt $i."
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Retrying in ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+            fi
+          done
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "::error::Failed to push $CHANNEL to itch.io after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Generate Step Summary
+        if: always()
+        run: |
+          CHANNEL="${{ matrix.os }}-${{ matrix.arch }}-nightly"
+          STATUS="${{ job.status == 'success' && 'Succeeded' || 'Failed' }}"
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ### Nightly Build Summary
+
+          | Property | Value |
+          | :--- | :--- |
+          | **OS** | \`${{ matrix.os }}\` |
+          | **Architecture** | \`${{ matrix.arch }}\` |
+          | **Channel** | \`$CHANNEL\` |
+          | **Build Date** | \`${{ env.NIGHTLY_DATE }}\` |
+          | **Destination** | [\`${ITCH_USERNAME}/${ITCH_PROJECT}\`](https://${ITCH_USERNAME}.itch.io/${ITCH_PROJECT}) |
+          | **Status** | $STATUS |
+          EOF
